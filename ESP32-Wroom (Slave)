@@ -1,0 +1,346 @@
+///slave code esp32 wroom - Buzzer & Button Only - Fixed
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// Wi-Fi credentials
+const char* ssid = "Door Lock wifi"; // <<< YOUR WIFI SSID
+const char* password = "EDITH@3000"; // <<< YOUR WIFI PASSWORD
+
+// Master device IP (ESP32-CAM running the Master code with Relay)
+const char* masterIP = "192.168.1.113"; // <<< YOUR MASTER ESP32-CAM IP ADDRESS
+const int masterPort = 80;
+
+// Pin definitions
+const int buttonPin = 2;  // GPIO2 for button input (sends request to Master)
+const int buzzerPin = 4;  // GPIO4 for buzzer output (triggered by Master)
+
+// Globals
+WebServer server(80);
+bool buttonState = false; // Current debounced button state (LOW if pressed)
+bool lastButtonState = false; // Previous raw reading
+bool buzzerState = false; // State for the Buzzer controlled via web/master (true = request ON)
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+TaskHandle_t buttonTaskHandle = NULL;
+TaskHandle_t buzzerTaskHandle = NULL; // Task for buzzer control
+SemaphoreHandle_t xMutex = NULL;
+
+// --- Function Declarations ---
+void handleRoot();
+void handleTriggerBuzzer(); // Triggered by Master
+void handleBuzzerStatus();  // Reports buzzer state
+void handleButtonStatus();  // Reports local button state
+void buttonTask(void * parameter); // Monitors local button, notifies Master
+void buzzerTask(void * parameter); // Controls the local buzzer timing
+
+// ==========================
+// ===       SETUP        ===
+// ==========================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\nBooting ESP32 Slave (Buzzer & Button)...");
+
+  // Initialize mutex
+  xMutex = xSemaphoreCreateMutex();
+  if (xMutex == NULL) {
+    Serial.println("FATAL: Mutex creation failed!");
+    ESP.restart();
+  }
+
+  // Set up GPIO pins
+  pinMode(buttonPin, INPUT_PULLUP);  // Button to trigger Master's relay/unlock
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);      // Ensure buzzer is off initially
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi...");
+  int connect_timeout = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    connect_timeout++;
+    if (connect_timeout > 40) { // ~20 seconds timeout
+        Serial.println("\nFATAL: WiFi connection timed out!");
+        ESP.restart();
+    }
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Set up web server endpoints
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/trigger-buzzer", HTTP_GET, handleTriggerBuzzer); // Master calls this
+  server.on("/buzzer-status", HTTP_GET, handleBuzzerStatus);
+  server.on("/button-status", HTTP_GET, handleButtonStatus);
+
+  // Start server
+  server.begin();
+  Serial.println("HTTP server started");
+
+  // Start tasks for button monitoring and buzzer control
+  xTaskCreatePinnedToCore(
+    buttonTask,           // Task function
+    "ButtonTask",         // Name of task
+    4096,                 // Stack size
+    NULL,                 // Task input parameter
+    1,                    // Priority
+    &buttonTaskHandle,    // Task handle
+    0                     // Core 0
+  );
+
+  xTaskCreatePinnedToCore(
+    buzzerTask,           // Task function
+    "BuzzerTask",         // Name of task
+    2048,                 // Stack size
+    NULL,                 // Task input parameter
+    1,                    // Priority
+    &buzzerTaskHandle,    // Task handle
+    1                     // Core 1
+  );
+}
+
+// =========================
+// ===     MAIN LOOP     ===
+// =========================
+void loop() {
+  server.handleClient();
+  delay(2); // Yield
+}
+
+// ==============================
+// === BACKGROUND TASKS (RTOS) ===
+// ==============================
+
+// --- Button Monitoring Task ---
+// Detects local button press and sends '/slave-request' to the Master ESP32-CAM
+void buttonTask(void * parameter) {
+  Serial.println("Button Task started");
+  for(;;) {
+    int reading = digitalRead(buttonPin);
+
+    // Debounce logic
+    if (reading != lastButtonState) {
+      lastDebounceTime = millis();
+    }
+
+    if ((millis() - lastDebounceTime) > debounceDelay) {
+      // If the button state has changed
+      if (reading != buttonState) {
+         if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+             buttonState = reading; // Update the debounced state safely
+             xSemaphoreGive(xMutex);
+         } else {
+             Serial.println("ButtonTask: Failed mutex for state update!");
+         }
+
+
+        // If button is pressed (LOW due to INPUT_PULLUP)
+        if (buttonState == LOW) {
+          Serial.println("Slave button pressed, contacting master to request unlock...");
+
+          // Send HTTP request to master to trigger its relay/unlock action
+          HTTPClient http;
+          // The Master listens on '/slave-request' for this signal
+          String url = "http://" + String(masterIP) + ":" + String(masterPort) + "/slave-request";
+
+          Serial.println("Requesting Master: " + url);
+          http.begin(url);
+          http.setTimeout(3000); // 3 second timeout
+          int httpCode = http.GET();
+
+          if (httpCode > 0) {
+            String payload = http.getString();
+            Serial.println("Master response code: " + String(httpCode));
+            Serial.println("Master response: " + payload); // Master should confirm relay activation
+          } else {
+            Serial.print("Error contacting master: ");
+            Serial.println(http.errorToString(httpCode).c_str());
+          }
+
+          http.end();
+        }
+      }
+    }
+
+    lastButtonState = reading; // Update last reading
+    vTaskDelay(pdMS_TO_TICKS(25)); // Check button state frequently
+  }
+}
+
+// --- Buzzer Control Task ---
+// Turns the buzzer ON for 1 second when buzzerState is set to true.
+void buzzerTask(void * parameter) {
+  Serial.println("Buzzer Task started");
+  static unsigned long buzzerStartTime = 0;
+  bool localBuzzerState; // Local copy of the desired state (true = turn on)
+  bool physicalBuzzerOn = false; // Actual physical state
+
+  for(;;) {
+    if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+      // Check if a request to turn ON the buzzer has been made
+      if (buzzerState) { // If buzzerState is true, start the ON sequence
+        if (!physicalBuzzerOn) { // Only start if not already ON
+          Serial.println("Buzzer ON sequence initiated.");
+          buzzerStartTime = millis();
+          physicalBuzzerOn = true;
+          digitalWrite(buzzerPin, HIGH); // Turn buzzer ON (assuming HIGH is ON)
+        }
+        buzzerState = false; // Reset the trigger flag immediately
+      }
+
+      // Check if the buzzer is currently ON and if its time is up
+      if (physicalBuzzerOn && (millis() - buzzerStartTime > 1000)) { // 1 second ON time
+          Serial.println("Buzzer OFF sequence (timeout).");
+          physicalBuzzerOn = false;
+          buzzerStartTime = 0;
+          digitalWrite(buzzerPin, LOW); // Turn buzzer OFF
+      }
+
+      xSemaphoreGive(xMutex);
+
+    } else {
+      Serial.println("BuzzerTask: Failed to take mutex!");
+    }
+    vTaskDelay(pdMS_TO_TICKS(50)); // Check state regularly
+  }
+}
+
+// =================================
+// === WEB SERVER HANDLERS       ===
+// =================================
+
+// --- Root HTML Page Handler ---
+// Shows status of local button and buzzer, allows testing local buzzer.
+void handleRoot() {
+  String html = "<html><head>";
+  html += "<title>Door Buzzer Control</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>"; // (CSS Styles - same as before)
+  html += "body{font-family:Arial;margin:0;padding:0;text-align:center;background:#f0f0f0;}";
+  html += "h1{margin:10px 0;color:#333;}";
+  html += ".container{max-width:480px;margin:0 auto;padding:20px;}";
+  html += ".status-box{background:#fff;border-radius:10px;padding:20px;margin:20px 0;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
+  html += ".status-item{margin:15px 0;display:flex;justify-content:space-between;align-items:center;}";
+  html += ".status-label{font-weight:bold;color:#555;}";
+  html += ".status-value{display:inline-block;font-weight:bold;padding:5px 10px;border-radius:15px;}";
+  html += ".on{background:#d4edda;color:#155724;}";
+  html += ".off{background:#f8d7da;color:#721c24;}";
+  html += ".btn{width:100%;background:#4CAF50;color:white;padding:12px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;margin-top:20px;}";
+  html += ".btn:hover{background:#45a049;}";
+  html += "</style>";
+  html += "<script>";
+  // Function to trigger the LOCAL buzzer via the web UI
+  html += "function triggerBuzzer() {";
+  html += "  let btn = document.getElementById('buzzerBtn');";
+  html += "  btn.disabled = true;";
+  // Calls the endpoint that activates the local buzzer
+  html += "  fetch('/trigger-buzzer')";
+  html += "    .then(response => response.json())";
+  html += "    .then(data => {";
+  html += "      console.log('Buzzer trigger response:', data);";
+  html += "      updateStatuses();"; // Refresh display
+  html += "      setTimeout(() => { btn.disabled = false; }, 1500);"; // Re-enable button
+  html += "    }).catch(e => { console.error('Error triggering buzzer:', e); btn.disabled=false; });";
+  html += "}";
+  // Function to update status elements by fetching data
+  html += "function updateStatuses() {";
+  // Fetch buzzer status
+  html += "  fetch('/buzzer-status')";
+  html += "    .then(response => response.json())";
+  html += "    .then(data => {";
+  html += "      const statusElem = document.getElementById('buzzer-status');";
+  html += "      statusElem.textContent = data.status ? 'ACTIVE' : 'INACTIVE';"; // Reflects if buzzer ON sequence is active
+  html += "      statusElem.className = 'status-value ' + (data.status ? 'on' : 'off');";
+  html += "    }).catch(e => console.error('Error fetching buzzer status:', e));";
+  // Fetch button status
+  html += "  fetch('/button-status')";
+  html += "    .then(response => response.json())";
+  html += "    .then(data => {";
+  html += "      const statusElem = document.getElementById('button-status');";
+  html += "      statusElem.textContent = data.pressed ? 'PRESSED' : 'RELEASED';";
+  html += "      statusElem.className = 'status-value ' + (data.pressed ? 'on' : 'off');";
+  html += "    }).catch(e => console.error('Error fetching button status:', e));";
+  html += "}";
+  // Run updates on load and periodically
+  html += "document.addEventListener('DOMContentLoaded', () => {";
+  html += "  updateStatuses();";
+  html += "  setInterval(updateStatuses, 2000);"; // Update every 2 seconds
+  html += "});";
+  html += "</script>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>DOOR BUZZER CONTROL</h1>";
+  html += "<div class='status-box'>";
+  // Status display for Buzzer and Button
+  html += "<div class='status-item'><span class='status-label'>Buzzer:</span> <span id='buzzer-status' class='status-value off'>INACTIVE</span></div>";
+  html += "<div class='status-item'><span class='status-label'>Button:</span> <span id='button-status' class='status-value off'>RELEASED</span></div>";
+  html += "</div>";
+  // Button to activate the local buzzer
+  html += "<button id='buzzerBtn' class='btn' onclick='triggerBuzzer()'>ACTIVATE BUZZER (Local Test)</button>";
+  html += "</div>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// --- Trigger Buzzer Handler ---
+// Called by the Master ESP32-CAM to activate the slave's buzzer
+void handleTriggerBuzzer() {
+  Serial.println("Trigger buzzer request received from Master");
+
+  if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    buzzerState = true;  // Signal the buzzerTask to turn the buzzer ON for 1s
+    xSemaphoreGive(xMutex);
+    // Respond quickly to the Master
+    server.send(200, "application/json", "{\"status\":true, \"message\":\"Buzzer activation requested\"}");
+  } else {
+    Serial.println("handleTriggerBuzzer: Failed to take mutex!");
+    server.send(500, "application/json", "{\"status\":false,\"error\":\"Server busy\"}");
+  }
+}
+
+// --- Buzzer Status Handler ---
+// Reports if the buzzer activation sequence is currently requested/active
+void handleBuzzerStatus() {
+  bool isBuzzerActive = false; // Default
+
+  if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+     // A simple check is the buzzerState flag. More accurate would involve checking
+     // physicalBuzzerOn from buzzerTask if shared carefully.
+     // For web UI, knowing the request was made (buzzerState was true) is often enough.
+     // Let's reflect the 'physicalBuzzerOn' state for slightly better accuracy,
+     // BUT it needs careful access or just use buzzerState. Let's use buzzerState for simplicity here.
+     // If you need exact physical state, buzzerTask needs to update a shared variable.
+     isBuzzerActive = buzzerState; // Or check a shared 'physicalBuzzerOn_shared' variable
+     xSemaphoreGive(xMutex);
+  } else {
+    Serial.println("handleBuzzerStatus: Failed to take mutex!");
+  }
+
+  String response = "{\"status\":" + String(isBuzzerActive ? "true" : "false") + "}";
+  server.send(200, "application/json", response);
+}
+
+
+// --- Button Status Handler --- (Remains the same)
+// Reports the debounced state of the local button
+void handleButtonStatus() {
+    bool pressed = false;
+
+    if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        pressed = (buttonState == LOW); // LOW means pressed with INPUT_PULLUP
+        xSemaphoreGive(xMutex);
+    } else {
+        Serial.println("handleButtonStatus: Failed to take mutex!");
+    }
+
+    String response = "{\"pressed\":" + String(pressed ? "true" : "false") + "}";
+    server.send(200, "application/json", response);
+}
