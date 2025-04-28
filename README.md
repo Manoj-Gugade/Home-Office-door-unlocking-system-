@@ -19,6 +19,7 @@ Listens for HTTP requests from the Slave device (e.g., unlock requests).
 Uses esp_camera, WiFi, WebServer, HTTPClient, ArduinoJson, and FreeRTOS features.
 
 **Slave Device (ESP32 WROOM)**
+
 Acts as a secondary control/notification unit.
 
 Hosts a simple web server for status display and manual buzzer activation.
