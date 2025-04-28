@@ -1,0 +1,520 @@
+///master code esp32 cam - Timed Streaming (Button & Web) - Relay Control - WebServer Version
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+
+// Camera pins for ESP32-CAM (AI Thinker board)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// Wi-Fi credentials
+const char* ssid = "Door Lock wifi"; // <<< YOUR WIFI SSID
+const char* password = "EDITH@3000"; // <<< YOUR WIFI PASSWORD
+
+// Slave device IP
+const char* slaveIP = "192.168.1.176"; // <<< YOUR SLAVE ESP32 IP ADDRESS
+const int slavePort = 80;
+
+// Pin definitions
+const int buttonPin = 2;  // GPIO2 for button input (modify as needed)
+const int relayPin = 14;  // GPIO14 for Relay output (modify as needed) - Formerly ledPin
+const int fanPin = 4;     // Example: GPIO4 for optional fan control
+
+// Globals
+WebServer server(80);
+bool buttonState = false; // Current debounced button state (LOW if pressed)
+bool lastButtonState = false; // Previous raw reading
+bool relayState = false; // State for the Relay controlled via web/slave (true = request ON)
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+TaskHandle_t buttonTaskHandle = NULL;
+TaskHandle_t relayTaskHandle = NULL; // Formerly ledTaskHandle
+SemaphoreHandle_t xMutex = NULL;
+
+// --- Streaming Control Globals ---
+bool streamingActive = false;           // Is the stream currently allowed?
+unsigned long streamStartTime = 0;      // When did the stream start?
+const unsigned long streamDuration = 2 * 60 * 1000; // 2 minutes in milliseconds
+// TaskHandle_t cameraTaskHandle = NULL; // REMOVED - No longer needed
+
+// Camera configuration variables
+framesize_t frameSize = FRAMESIZE_QVGA;  // 320x240
+int jpegQuality = 12;                    // Lower = better quality, higher compression
+
+// --- Function Declarations ---
+void handleRoot();
+void handleUnlockDoor(); // This will now trigger the relay
+void handleToggleStream();
+void handleStream();
+void handleStreamStatus();
+void handleSlaveRequest(); // This will now trigger the relay
+void buttonTask(void * parameter);
+void relayTask(void * parameter); // Formerly ledTask
+// void cameraTask(void *parameter); // REMOVED
+
+// ==========================
+// ===       SETUP        ===
+// ==========================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\nBooting ESP32-CAM Master (Timed Streaming, Relay Control)...");
+
+  // Initialize mutex
+  xMutex = xSemaphoreCreateMutex();
+  if (xMutex == NULL) {
+    Serial.println("FATAL: Mutex creation failed!");
+    ESP.restart();
+  }
+
+  // Configure camera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG; // Use JPEG for streaming
+
+  // Adjust frame size and quality based on PSRAM
+  if(psramFound()){
+    config.frame_size = frameSize; // Use QVGA or as defined
+    config.jpeg_quality = jpegQuality; // Use defined quality
+    config.fb_count = 2; // Need 2 buffers for smoother capture/stream access
+    Serial.println("PSRAM found.");
+  } else {
+    config.frame_size = FRAMESIZE_QVGA; // Fallback to QVGA if no PSRAM
+    config.jpeg_quality = 15;           // Slightly lower quality if less memory
+    config.fb_count = 1; // Only 1 buffer if no PSRAM
+    Serial.println("No PSRAM found, using QVGA/1 buffer.");
+  }
+  Serial.printf("Frame Size: %d, JPEG Quality: %d\n", config.frame_size, config.jpeg_quality);
+
+
+  // Camera init
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("FATAL: Camera init failed with error 0x%x\n", err);
+    delay(1000);
+    ESP.restart();
+  }
+  Serial.println("Camera initialized successfully.");
+
+  // --- SET GRAYSCALE --- (Optional)
+  sensor_t * s = esp_camera_sensor_get();
+  if (s != NULL) {
+     s->set_special_effect(s, 2); // 0=Normal, 1=Negative, 2=Grayscale, 3=Red Tint, 4=Green Tint, 5=Blue Tint, 6=Sepia
+     Serial.println("Camera set to Grayscale.");
+  } else {
+     Serial.println("WARNING: Failed to get camera sensor handle to set effect!");
+  }
+
+  // Set up GPIO pins
+  pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, LOW); // Ensure relay is OFF initially (assuming LOW is OFF)
+  pinMode(fanPin, OUTPUT);     // Fan control pin
+  digitalWrite(fanPin, HIGH);  // Turn Fan ON initially (example) - Adjust as needed
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi...");
+  int connect_timeout = 0;
+   while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    connect_timeout++;
+    if (connect_timeout > 40) { // ~20 seconds timeout
+        Serial.println("\nFATAL: WiFi connection timed out!");
+        ESP.restart();
+    }
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Set up web server endpoints
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/unlock-door", HTTP_GET, handleUnlockDoor); // Triggers relay
+  server.on("/toggle-stream", HTTP_GET, handleToggleStream); // Handles start/stop AND timer
+  server.on("/stream", HTTP_GET, handleStream);             // Sends one frame if active
+  server.on("/stream-status", HTTP_GET, handleStreamStatus); // Reports active status
+  server.on("/slave-request", HTTP_GET, handleSlaveRequest); // Triggers relay
+
+  // Start server
+  server.begin();
+  Serial.println("HTTP server started");
+
+  // Start tasks for button monitoring and relay control
+  xTaskCreatePinnedToCore(buttonTask, "ButtonTask", 4096, NULL, 1, &buttonTaskHandle, 0);
+  xTaskCreatePinnedToCore(relayTask, "RelayTask", 2048, NULL, 1, &relayTaskHandle, 1); // Renamed task
+
+}
+
+// =========================
+// ===     MAIN LOOP     ===
+// =========================
+void loop() {
+  // Handle web server requests
+  server.handleClient();
+
+  // --- Stream timeout check ---
+  if (xSemaphoreTake(xMutex, (TickType_t) 10) == pdTRUE) { // Quick check
+    if (streamingActive && (millis() - streamStartTime >= streamDuration)) {
+      streamingActive = false;
+      Serial.println("Streaming stopped due to timeout.");
+    }
+    xSemaphoreGive(xMutex);
+  }
+  // --- End stream timeout check ---
+
+  delay(2); // Small delay to yield control
+}
+
+
+// ==============================
+// === BACKGROUND TASKS (RTOS) ===
+// ==============================
+
+// --- Button Monitoring Task ---
+// MODIFIED: Starts timed stream on press, triggers slave buzzer
+void buttonTask(void * parameter) {
+  Serial.println("Button Task started");
+  for(;;) {
+    int reading = digitalRead(buttonPin);
+
+    // Debounce logic
+    if (reading != lastButtonState) {
+      lastDebounceTime = millis();
+    }
+
+    if ((millis() - lastDebounceTime) > debounceDelay) {
+      // If the button state has changed
+      if (reading != buttonState) {
+         bool needsMutex = false;
+
+         if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+           needsMutex = true;
+           buttonState = reading; // Update the debounced state
+         } else {
+            Serial.println("ButtonTask: Failed to take mutex for state update!");
+         }
+
+        // If button is pressed (LOW due to INPUT_PULLUP)
+        if (buttonState == LOW) {
+          Serial.println("Master Button Pressed.");
+
+          // --- Start timed streaming if not already active ---
+          if (needsMutex) {
+             if (!streamingActive) {
+                 streamingActive = true;
+                 streamStartTime = millis();
+                 Serial.println("Streaming started via BUTTON (2 min).");
+             } else {
+                 Serial.println("Streaming was already active (Button press ignored for starting stream).");
+             }
+          } else {
+              Serial.println("ButtonTask: Could not activate stream (mutex error).");
+          }
+          // --- End stream activation ---
+
+
+          // --- Trigger Slave Buzzer ---
+          Serial.println("Attempting to contact Slave...");
+          HTTPClient http;
+          String url = "http://" + String(slaveIP) + ":" + String(slavePort) + "/trigger-buzzer";
+          Serial.println("Contacting Slave URL: " + url);
+
+          http.begin(url);
+          http.setTimeout(3000); // 3 second timeout
+          int httpCode = http.GET();
+
+          if (httpCode > 0) {
+            Serial.printf("[HTTP] GET response code from Slave: %d\n", httpCode);
+            if (httpCode == HTTP_CODE_OK) {
+              Serial.println("Buzzer triggered successfully on slave.");
+            } else {
+              Serial.printf("Received HTTP status %d from Slave.\n", httpCode);
+            }
+          } else {
+            Serial.print("Error triggering buzzer on slave. ");
+            Serial.printf("[HTTP] GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+          }
+          http.end();
+          // --- End Trigger Slave Buzzer ---
+        }
+
+        // Give back the mutex if we took it
+        if (needsMutex) {
+            xSemaphoreGive(xMutex);
+        }
+      }
+    }
+
+    lastButtonState = reading;
+    vTaskDelay(pdMS_TO_TICKS(25)); // Check ~40 times/sec
+  }
+}
+
+// --- Relay Control Task --- (Formerly ledTask)
+// Turns the relay ON for 1 second when relayState is set to true.
+void relayTask(void * parameter) {
+  Serial.println("Relay Task started");
+  static unsigned long relayStartTime = 0;
+  bool localRelayState; // Local copy of the desired state (true = turn on)
+  bool physicalRelayOn = false; // Actual physical state
+
+  for(;;) {
+    if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+      // Check if a request to turn ON the relay has been made
+      if (relayState) { // If relayState is true, we need to start the ON sequence
+        if (!physicalRelayOn) { // Only start if it's not already in the ON sequence
+          Serial.println("Relay ON sequence initiated.");
+          relayStartTime = millis(); // Record the start time
+          physicalRelayOn = true; // Mark that the physical relay should be ON
+          digitalWrite(relayPin, HIGH); // Turn the relay ON (assuming HIGH is ON)
+        }
+        relayState = false; // Reset the trigger flag immediately after acknowledging
+      }
+
+      // Check if the relay is currently ON and if its time is up
+      if (physicalRelayOn && (millis() - relayStartTime > 1000)) { // 1 second ON time
+          Serial.println("Relay OFF sequence (timeout).");
+          physicalRelayOn = false; // Mark that the physical relay should be OFF
+          relayStartTime = 0;      // Reset timer
+          digitalWrite(relayPin, LOW); // Turn the relay OFF (assuming LOW is OFF)
+      }
+
+      xSemaphoreGive(xMutex);
+
+    } else {
+      Serial.println("RelayTask: Failed to take mutex!");
+    }
+    vTaskDelay(pdMS_TO_TICKS(50)); // Check state every 50ms
+  }
+}
+
+
+// =================================
+// === WEB SERVER HANDLERS       ===
+// =================================
+
+// --- Root HTML Page Handler (remains the same) ---
+// Displays camera stream and buttons
+void handleRoot() {
+  // HTML/CSS/JS structure is the same. "UNLOCK DOOR" button now triggers the relay via /unlock-door endpoint.
+  String html = "<html><head>";
+  html += "<title>Door Camera</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "body{font-family:Arial;margin:0;padding:0;text-align:center;background:#f0f0f0;}";
+  html += "h1{margin:10px 0;color:#333;}";
+  html += ".container{max-width:640px;margin:0 auto;padding:10px;}";
+  html += ".camera-box{width:320px;height:240px;background:#000;position:relative;overflow:hidden;margin:10px auto;border-radius:8px;}";
+  html += ".camera-box img{width:100%;height:100%;display:block;object-fit:contain;}";
+  html += ".stream-status{position:absolute;top:5px;left:5px;background:rgba(0,0,0,0.6);color:#fff;font-size:12px;padding:4px 8px;border-radius:4px;}";
+  html += ".btn-row{display:flex;justify-content:space-around;margin-top:10px;}";
+  html += ".btn{flex-basis: 45%;margin:0 5px;padding:12px;border:none;border-radius:8px;font-size:16px;font-weight:bold;cursor:pointer;}";
+  html += ".btn-unlock{background:#4CAF50;color:white;}"; // Unlock button style
+  html += ".btn-stream{background:#2196F3;color:white;}"; // Stream button style
+  html += ".btn-unlock:hover{background:#45a049;}";
+  html += ".btn-stream:hover{background:#0b7dda;}";
+  html += ".inactive{background:#607D8B;}"; // Style for inactive stream button
+  html += "</style>";
+  html += "<script>";
+  html += "let isStreaming = false;";
+  html += "let streamTimer = null;";
+  // unlockDoor function now calls /unlock-door which triggers the relay on the backend
+  html += "function unlockDoor() { let btn = document.getElementById('unlockBtn'); btn.disabled = true; fetch('/unlock-door').then(r=>r.json()).then(d=>{ console.log(d); setTimeout(()=>{btn.disabled=false;},1500); }).catch(e=>{ console.error('Error:',e); btn.disabled=false; }); }";
+  html += "function toggleStream() { fetch('/toggle-stream').then(r=>r.json()).then(d=>{ isStreaming=d.streaming; updateStreamUI(); }).catch(e=>console.error('Error:',e)); }";
+  html += "function updateStreamUI() { const s=document.getElementById('streamStatus'); const b=document.getElementById('streamBtn'); const i=document.getElementById('streamImg'); if(isStreaming){ s.textContent='Stream Active'; b.textContent='Stop Stream'; b.classList.remove('inactive'); if(streamTimer)clearInterval(streamTimer); streamTimer=setInterval(()=>{ i.src='/stream?'+new Date().getTime(); }, 300); i.style.display='block'; } else { s.textContent='Stream Inactive'; b.textContent='Start Stream'; b.classList.add('inactive'); if(streamTimer)clearInterval(streamTimer); streamTimer=null; i.src=''; i.style.display='none'; } }";
+  html += "function checkStreamStatus() { fetch('/stream-status').then(r=>r.json()).then(d=>{ if(isStreaming !== d.streaming){ isStreaming=d.streaming; updateStreamUI(); } }).catch(e=>console.error('Error:',e)); }";
+  html += "document.addEventListener('DOMContentLoaded',()=>{ checkStreamStatus(); setInterval(checkStreamStatus, 3000); });";
+  html += "</script>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>DOOR CAMERA</h1>";
+  html += "<div class='camera-box'>";
+  html += "<img id='streamImg' src='' width='320' height='240' alt='Camera Stream' style='display:none;'>";
+  html += "<div id='streamStatus' class='stream-status'>Stream Inactive</div>";
+  html += "</div>";
+  html += "<div class='btn-row'>";
+  // "UNLOCK DOOR" button calls unlockDoor() JS function
+  html += "<button id='unlockBtn' class='btn btn-unlock' onclick='unlockDoor()'>UNLOCK DOOR</button>";
+  html += "<button id='streamBtn' class='btn btn-stream inactive' onclick='toggleStream()'>START STREAM</button>";
+  html += "</div>";
+  html += "</div>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+
+// --- Toggle Stream Handler ---
+// Starts/stops the timed video stream
+void handleToggleStream() {
+  bool newState = false;
+
+  if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
+    bool oldState = streamingActive;
+    streamingActive = !streamingActive; // Toggle the state
+    newState = streamingActive;
+
+    if (newState == true && oldState == false) { // Check if we just turned it ON
+      streamStartTime = millis(); // Start the timer
+      Serial.println("Streaming started via WEB (2 min).");
+    } else if (newState == false) {
+        Serial.println("Streaming stopped via WEB.");
+    }
+    xSemaphoreGive(xMutex);
+
+  } else {
+     Serial.println("handleToggleStream: Failed to take mutex!");
+     server.send(500, "application/json", "{\"error\":\"Server busy\"}");
+     return;
+  }
+  // Send JSON response
+  server.send(200, "application/json",
+    "{\"streaming\":" + String(newState ? "true" : "false") + "}");
+}
+
+// --- Stream Status Handler ---
+// Reports whether the stream is currently active
+void handleStreamStatus() {
+  bool currentState = false;
+  if (xSemaphoreTake(xMutex, (TickType_t) 100) == pdTRUE) {
+    currentState = streamingActive;
+    xSemaphoreGive(xMutex);
+  } else {
+      Serial.println("handleStreamStatus: Failed to take mutex!");
+      server.send(500, "application/json", "{\"error\":\"Server busy\"}");
+      return;
+  }
+  server.send(200, "application/json",
+    "{\"streaming\":" + String(currentState ? "true" : "false") + "}");
+}
+
+// --- Unlock Door Handler --- (Now controls Relay)
+// Sets the flag to activate the relay via the relayTask
+void handleUnlockDoor() {
+  Serial.println("Unlock door request received (triggering relay)");
+  if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    relayState = true; // Signal the relayTask to turn the relay ON for 1s
+    xSemaphoreGive(xMutex);
+    server.send(200, "application/json", "{\"status\":true,\"message\":\"Relay activated\"}"); // Updated message
+  } else {
+    Serial.println("handleUnlockDoor: Failed to take mutex!");
+    server.send(500, "application/json", "{\"status\":false,\"message\":\"Server busy\"}");
+  }
+}
+
+// --- Slave Request Handler --- (Now controls Relay)
+// Handles request from the slave device, sets the flag to activate the relay
+void handleSlaveRequest() {
+  Serial.println("Received request from Slave device - triggering relay.");
+  if (xSemaphoreTake(xMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    relayState = true; // Signal the relayTask to turn the relay ON for 1s
+    xSemaphoreGive(xMutex);
+    server.send(200, "application/json", "{\"status\":\"success\",\"message\":\"Relay activated\"}"); // Updated message
+  } else {
+    Serial.println("handleSlaveRequest: Failed to take mutex!");
+    server.send(500, "application/json", "{\"status\":\"error\",\"message\":\"Server busy\"}");
+  }
+}
+
+// --- Stream Handler ---
+// Sends a single MJPEG frame if streaming is active
+void handleStream() {
+  bool isStreamingNow = false;
+
+  // Check if streaming is currently allowed
+  if (xSemaphoreTake(xMutex, (TickType_t) 50) == pdTRUE) { // Short timeout for mutex
+      isStreamingNow = streamingActive;
+      xSemaphoreGive(xMutex);
+  } else {
+      Serial.println("handleStream: Failed to get mutex!");
+      isStreamingNow = false; // Safest is to not stream if state unknown
+  }
+
+  // If streaming is not active, send appropriate response
+  if(!isStreamingNow) {
+      server.sendHeader("Connection", "close");
+      server.send(204); // 204 No Content
+      return;
+  }
+
+  // Proceed with sending a frame
+  WiFiClient client = server.client();
+  if(!client.connected()) {
+      return; // Client disconnected
+  }
+
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+
+  // Try to get frame buffer
+  fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed for stream");
+    server.sendHeader("Connection", "close");
+    server.send(500, "text/plain", "Camera Capture Failed");
+    esp_camera_fb_return(fb); // Return buffer even if failed? Check docs, likely not needed if NULL
+    return;
+  }
+
+   // Check frame buffer format
+    if (fb->format != PIXFORMAT_JPEG) {
+        Serial.printf("Camera capture format is not JPEG (%d), cannot stream directly.\n", fb->format);
+        server.sendHeader("Connection", "close");
+        server.send(500, "text/plain", "Incorrect Camera Format");
+        esp_camera_fb_return(fb); // Return the buffer
+        return;
+    }
+
+
+  // Send MJPEG frame header
+  server.sendHeader("Content-Type", "image/jpeg");
+  server.sendHeader("Connection", "close"); // Close after this frame
+  server.setContentLength(fb->len);
+
+  // Send HTTP OK status and headers
+  server.send(200);
+
+  // Send the image buffer
+  client.write(fb->buf, fb->len);
+
+  // Return the frame buffer to be reused
+  esp_camera_fb_return(fb);
+  fb = NULL; // Mark as returned
+
+}
